@@ -1,0 +1,33 @@
+--- a/omnivoice/models/omnivoice.py
++++ b/omnivoice/models/omnivoice.py
+@@ -358,9 +358,26 @@ class OmniVoice(PreTrainedModel):
+ 
+-                # higgs-audio-v2-tokenizer does not support MPS
+-                # (output channels > 65536)
+-                tokenizer_device = (
+-                    "cpu" if str(model.device).startswith("mps") else model.device
+-                )
++                # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
++                # and encounters severe MIOpen workspace buffer bugs on Windows ROCm.
++                # Running audio_tokenizer on CPU bypasses MIOpen Conv1d fallback while
++                # keeping the main LLM diffusion backbone on GPU.
++                is_rocm_windows = (
++                    os.name == "nt" and getattr(torch.version, "hip", None) is not None
++                )
++                tokenizer_device = (
++                    "cpu"
++                    if (str(model.device).startswith("mps") or is_rocm_windows)
++                    else model.device
++                )
++
++                if is_rocm_windows:
++                    # AOTriton lacks precompiled kernels for RDNA4/gfx1201 on Windows ROCm,
++                    # which triggers heavy JIT compilation lag. Disabling mem_efficient and flash
++                    # forces native math SDP which executes directly on AMD Tensor Cores.
++                    torch.backends.cuda.enable_mem_efficient_sdp(False)
++                    torch.backends.cuda.enable_flash_sdp(False)
++                    torch.backends.cuda.enable_math_sdp(True)
++
+                 model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
+                     audio_tokenizer_path, device_map=tokenizer_device
+                 )
