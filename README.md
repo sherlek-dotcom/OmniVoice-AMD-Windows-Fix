@@ -4,7 +4,8 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.9.1%2Brocm7.2.1-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Hardware](https://img.shields.io/badge/Architecture-RDNA%204%20%7C%20RDNA%203-blue)](https://www.amd.com/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011%20x64-0078D6?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
-[![Performance](https://img.shields.io/badge/Real--Time%20Factor-0.42x%20(2.4x%20Realtime)-brightgreen)](https://github.com/sherlek-dotcom/OmniVoice-AMD-Windows-Fix)
+[![Performance](https://img.shields.io/badge/Real--Time%20Factor-0.35x%20(2.84x%20Realtime)-brightgreen)](https://github.com/sherlek-dotcom/OmniVoice-AMD-Windows-Fix)
+[![Benchmark](https://img.shields.io/badge/Benchmark-8--Style%20Peterc3%20Comparison-success)](BENCHMARK_REPORT.md)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 > **Zero-overhead Hybrid Pipeline patch for [k2-fsa/OmniVoice](https://github.com/k2-fsa/OmniVoice) running under native Windows with AMD ROCm.**  
@@ -21,6 +22,24 @@ Tested on **AMD Radeon RX 9070 XT** (16GB VRAM, RDNA 4) + Ryzen 16-Core CPU on W
 | **Vanilla GPU (ROCm Windows)** | ⚠️ `MIOpen Workspace 0` + `AOTriton JIT` | **25s – 60s+** | **11+ Minutes** | ~20.0x (Extremely Slow) |
 | **CPU Only (16 Threads)** | ✅ oneDNN AVX | ~20s – 30s | ~1.5 – 2 Minutes | ~3.5x |
 | **🚀 Hybrid Fix (This Repo)** | **✅ Clean (Zero Warnings, Zero Fallbacks)** | **~2.1s** | **~14.3 Seconds** | **0.42x (2.4x faster than speech!)** |
+
+### 🔬 Head-to-Head Comparison: Decoupled Hybrid vs Peterc3 Method ([omnivoice-gfx1150](https://github.com/Peterc3-dev/omnivoice-gfx1150))
+
+In Peterc3's landmark report, running OmniVoice on AMD APUs required `MIOPEN_FIND_MODE=FAST` to work around MIOpen fallback warnings, reaching **49s for 20s output (RTF ~2.45)**.
+
+We stress-tested **8 diverse voice styles** (Hook, Technical Explainer, Excited, Serious, Phonetic, Confident, Narrative, CTA) comparing Peterc3's All-GPU method (`MIOPEN_FIND_MODE=FAST`) against our Decoupled Hybrid pipeline on the same AMD hardware:
+
+| Metric | All-GPU Baseline (Peterc3 Method) | 🚀 Decoupled Hybrid (This Repo) | Improvement / Delta |
+| :--- | :---: | :---: | :---: |
+| **Total Audio Synthesized** | 49.37s | 49.37s | Identical testset |
+| **Total Generation Time** | 21.29s | **19.28s** | **1.10x Faster** (Up to 1.18x per style) |
+| **Best Real-Time Factor (RTF)** | 0.358 | **0.352 (2.84x Realtime)** | Lowest latency |
+| **Overall RTF (8 Styles)** | 0.431 | **0.391 (2.56x Realtime)** | Sustained high throughput |
+| **Peak VRAM Allocated** | 2,425.4 MB | **1,660.0 MB** | **+765.4 MB Saved (-31.6%)** |
+| **MIOpen Conv1d Fallbacks** | Susceptible if Find DB misses | **0 (Completely Bypassed)** | 100% Deterministic |
+
+> [!TIP]
+> 👉 **[Click here to view the Full 8-Style Benchmark & Architecture Report (BENCHMARK_REPORT.md)](BENCHMARK_REPORT.md)** with per-style RTF breakdown, acoustic notes, and VRAM memory profiling.
 
 ---
 
@@ -108,9 +127,18 @@ run_webui.bat
 ```
 Access the Gradio WebUI at `http://127.0.0.1:8001`.
 
-### Run Benchmark / Test Script:
+### Run Quick Benchmark / Test Script:
 ```cmd
 .venv_rocm\Scripts\python.exe benchmark.py
+```
+
+### Run the Full 8-Style Benchmark Comparison Suite:
+```cmd
+# 1. Run comparison in isolated subprocesses
+.venv_rocm\Scripts\python.exe benchmark/run_comparison.py --runs 2
+
+# 2. Generate updated Markdown report
+.venv_rocm\Scripts\python.exe benchmark/generate_report.py
 ```
 
 ---
