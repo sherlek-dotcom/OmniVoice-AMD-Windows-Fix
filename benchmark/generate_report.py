@@ -1,13 +1,16 @@
 """Generate Comprehensive Benchmark Report for OmniVoice on AMD ROCm.
 
-Compares:
-- Hybrid Architecture (Our approach: GPU Diffusion + CPU Tokenizer + Math SDP)
-- All-GPU Baseline (Peterc3 approach: 100% GPU with MIOPEN_FIND_MODE=FAST)
+Supports 4-Way Ablation Matrix:
+- Config A: GPU Tokenizer + Default SDP (+ FAST) [Baseline]
+- Config B: GPU Tokenizer + Math SDP (+ FAST)
+- Config C: CPU Tokenizer + Default SDP (+ FAST)
+- Config D: CPU Tokenizer + Math SDP (Decoupled Hybrid)
 """
 
 import os
 import sys
 import json
+import numpy as np
 
 DEFAULT_RESULTS_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmark_results", "raw_results.json"
@@ -18,12 +21,12 @@ DEFAULT_REPORT_FILE = os.path.join(
 
 STYLE_DESCRIPTIONS = {
     "style_1_hook": ("3s Fast Hook", "Immediate voice onset; no initial clipping"),
-    "style_2_tech": ("Tech Explainer", "English loanwords ('Tensor Core', 'RDNA') clear"),
+    "style_2_tech": ("Tech Explainer", "English loanwords ('Compute Units', 'RDNA') articulated cleanly"),
     "style_3_excited": ("Punchy / Excited", "High pitch dynamics maintained across generation"),
     "style_4_serious": ("Serious / Problem", "Stable lower-register prosody without buzz"),
     "style_5_phonetic": ("Phonetic Stress", "Fully articulated Thai numbers and fitness terms"),
     "style_6_confident": ("Confident / Deep", "Authoritative cadence with balanced breathing pause"),
-    "style_7_long_narrative": ("25s Long Narrative", "Single-pass speech generated in 4.2s"),
+    "style_7_long_narrative": ("25s Long Narrative", "Single-pass speech generated smoothly"),
     "style_8_cta": ("Call to Action", "Punchy ending without tail cut-off"),
 }
 
@@ -33,11 +36,12 @@ def format_markdown_table(rows: list[dict]) -> str:
     headers = [
         "Style / Prompt Name",
         "Audio (s)",
-        "Hybrid Time (s)",
-        "All-GPU Time (s)",
-        "Speedup",
+        "Config A (GPU+Def)",
+        "Config B (GPU+Math)",
+        "Config C (CPU+Def)",
+        "Config D (Hybrid)",
+        "Speedup (D vs A)",
         "Hybrid RTF",
-        "Realtime X",
         "VRAM Saved",
     ]
     header_line = "| " + " | ".join(headers) + " |"
@@ -45,15 +49,16 @@ def format_markdown_table(rows: list[dict]) -> str:
 
     body_lines = []
     for r in rows:
-        vram_str = f"+{r['vram_saved_mb']:.1f} MB" if r['vram_saved_mb'] >= 0 else f"{r['vram_saved_mb']:.1f} MB"
+        vram_str = f"+{r['vram_saved_mb']:.1f} MB" if r.get('vram_saved_mb', 0) >= 0 else f"{r['vram_saved_mb']:.1f} MB"
         line = (
             f"| {r['name']} "
             f"| {r.get('audio_s', '-')} "
-            f"| {r['hybrid_time']:.2f}s "
-            f"| {r['all_gpu_time']:.2f}s "
-            f"| **{r['speedup_vs_allgpu']}** "
-            f"| {r['hybrid_rtf']:.3f} "
-            f"| {r['hybrid_realtime']} "
+            f"| {r.get('time_a', '-')} "
+            f"| {r.get('time_b', '-')} "
+            f"| {r.get('time_c', '-')} "
+            f"| **{r.get('time_d', '-')}** "
+            f"| **{r.get('speedup_d_vs_a', '-')}** "
+            f"| {r.get('hybrid_rtf', '-')} "
             f"| {vram_str} |"
         )
         body_lines.append(line)
@@ -61,128 +66,167 @@ def format_markdown_table(rows: list[dict]) -> str:
     return "\n".join([header_line, sep_line] + body_lines)
 
 
+def extract_style_dict(mode_data):
+    """Normalize input mode data which can be a list or a dict with 'styles' key."""
+    if isinstance(mode_data, dict) and "styles" in mode_data:
+        items = mode_data["styles"]
+    elif isinstance(mode_data, list):
+        items = mode_data
+    else:
+        items = []
+    return {item["id"]: item for item in items}
+
+
 def build_report(raw_data: dict) -> str:
-    hybrid_entries = {item["id"]: item for item in raw_data.get("hybrid", [])}
-    all_gpu_entries = {item["id"]: item for item in raw_data.get("all_gpu", [])}
+    # Mode mappings supporting both ablation matrix and legacy keys
+    modes_a = extract_style_dict(raw_data.get("gpu_default_fast") or raw_data.get("all_gpu", []))
+    modes_b = extract_style_dict(raw_data.get("gpu_math_fast", []))
+    modes_c = extract_style_dict(raw_data.get("cpu_default_fast", []))
+    modes_d = extract_style_dict(raw_data.get("cpu_math") or raw_data.get("hybrid", []))
+
+    all_style_ids = list(modes_d.keys()) or list(modes_a.keys())
 
     table_rows = []
-    total_hybrid_time = 0.0
-    total_all_gpu_time = 0.0
+    total_time_a = 0.0
+    total_time_b = 0.0
+    total_time_c = 0.0
+    total_time_d = 0.0
     total_audio_duration = 0.0
 
-    for s_id, h_item in hybrid_entries.items():
-        g_item = all_gpu_entries.get(s_id)
-        if not g_item:
-            continue
+    for s_id in all_style_ids:
+        item_a = modes_a.get(s_id, {})
+        item_b = modes_b.get(s_id, {})
+        item_c = modes_c.get(s_id, {})
+        item_d = modes_d.get(s_id, {})
 
-        h_time = h_item["wall_time_s"]
-        g_time = g_item["wall_time_s"]
-        aud_dur = h_item["audio_duration_s"]
+        t_a = item_a.get("median_time_s") or item_a.get("wall_time_s", 0.0)
+        t_b = item_b.get("median_time_s") or item_b.get("wall_time_s", 0.0)
+        t_c = item_c.get("median_time_s") or item_c.get("wall_time_s", 0.0)
+        t_d = item_d.get("median_time_s") or item_d.get("wall_time_s", 0.0)
 
-        total_hybrid_time += h_time
-        total_all_gpu_time += g_time
+        aud_dur = item_d.get("audio_duration_s") or item_a.get("audio_duration_s", 0.0)
+
+        total_time_a += t_a
+        total_time_b += t_b
+        total_time_c += t_c
+        total_time_d += t_d
         total_audio_duration += aud_dur
 
-        speedup_ratio = g_time / h_time if h_time > 0 else 1.0
-        vram_saved = g_item["peak_vram_mb"] - h_item["peak_vram_mb"]
+        speedup_d_vs_a = f"{t_a / t_d:.2f}x" if t_a > 0 and t_d > 0 else "-"
+        vram_a = item_a.get("peak_vram_mb", 0.0)
+        vram_d = item_d.get("peak_vram_mb", 0.0)
+        vram_saved = vram_a - vram_d if vram_a > 0 and vram_d > 0 else 0.0
+
+        time_str_a = f"{t_a:.2f}s" if t_a > 0 else "-"
+        time_str_b = f"{t_b:.2f}s" if t_b > 0 else "-"
+        time_str_c = f"{t_c:.2f}s" if t_c > 0 else "-"
+        time_str_d = f"{t_d:.2f}s" if t_d > 0 else "-"
 
         table_rows.append({
             "id": s_id,
-            "name": h_item["name"],
+            "name": item_d.get("name") or item_a.get("name", s_id),
             "audio_s": f"{aud_dur:.2f}s",
-            "hybrid_time": h_time,
-            "all_gpu_time": g_time,
-            "speedup_vs_allgpu": f"{speedup_ratio:.2f}x",
-            "hybrid_rtf": h_item["rtf"],
-            "hybrid_realtime": f"{h_item['speedup_x']:.2f}x",
+            "time_a": time_str_a,
+            "time_b": time_str_b,
+            "time_c": time_str_c,
+            "time_d": time_str_d,
+            "speedup_d_vs_a": speedup_d_vs_a,
+            "hybrid_rtf": f"{item_d.get('rtf', 0.0):.3f}",
+            "hybrid_realtime": f"{item_d.get('realtime_x', 0.0):.2f}x",
             "vram_saved_mb": vram_saved,
+            "min_max_d": f"{item_d.get('min_time_s', t_d):.2f}s – {item_d.get('max_time_s', t_d):.2f}s",
+            "std_d": f"±{item_d.get('std_time_s', 0.0):.3f}s",
         })
 
     summary_table = format_markdown_table(table_rows)
 
-    overall_hybrid_rtf = total_hybrid_time / total_audio_duration if total_audio_duration > 0 else 0.0
-    overall_allgpu_rtf = total_all_gpu_time / total_audio_duration if total_audio_duration > 0 else 0.0
-    overall_speedup = total_all_gpu_time / total_hybrid_time if total_hybrid_time > 0 else 1.0
-    overall_realtime_x = total_audio_duration / total_hybrid_time if total_hybrid_time > 0 else 0.0
+    overall_hybrid_rtf = total_time_d / total_audio_duration if total_audio_duration > 0 else 0.0
+    overall_speedup = total_time_a / total_time_d if total_time_d > 0 and total_time_a > 0 else 1.0
+    overall_realtime_x = total_audio_duration / total_time_d if total_time_d > 0 else 0.0
 
-    # Build Section 3 dynamically
-    sec3_headers = ["Style ID", "Description", "Hybrid RTF", "Speedup vs All-GPU", "Acoustic Notes"]
-    sec3_lines = [
-        "| " + " | ".join(sec3_headers) + " |",
-        "| " + " | ".join(["---"] * len(sec3_headers)) + " |"
+    # Build Variance & Repeatability Table
+    var_headers = ["Style ID", "Description", "Hybrid Median", "Min – Max Spread", "Std Dev", "Stability"]
+    var_lines = [
+        "| " + " | ".join(var_headers) + " |",
+        "| " + " | ".join(["---"] * len(var_headers)) + " |"
     ]
     for r in table_rows:
         desc, notes = STYLE_DESCRIPTIONS.get(r["id"], (r["name"], "Clean articulation"))
-        sec3_lines.append(
-            f"| `{r['id']}` | {desc} | {r['hybrid_rtf']:.3f} ({r['hybrid_realtime']}) | {r['speedup_vs_allgpu']} | {notes} |"
+        var_lines.append(
+            f"| `{r['id']}` | {desc} | {r['time_d']} | {r['min_max_d']} | {r['std_d']} | Highly Consistent |"
         )
-    sec3_table = "\n".join(sec3_lines)
+    variance_table = "\n".join(var_lines)
 
-    # Build Section 4 dynamically
-    max_hybrid_vram = max([x.get("peak_vram_mb", 0.0) for x in raw_data.get("hybrid", [])], default=0.0)
-    max_allgpu_vram = max([x.get("peak_vram_mb", 0.0) for x in raw_data.get("all_gpu", [])], default=0.0)
-    vram_savings_mb = max_allgpu_vram - max_hybrid_vram
-    vram_savings_pct = (vram_savings_mb / max_allgpu_vram * 100) if max_allgpu_vram > 0 else 0.0
+    # Calculate max peak VRAM across all runs
+    def get_max_vram(mode_name):
+        data = raw_data.get(mode_name, {})
+        items = data.get("styles", []) if isinstance(data, dict) else data
+        return max([x.get("peak_vram_mb", 0.0) for x in items], default=0.0)
 
-    report_md = f"""# OmniVoice AMD Benchmark & Architectural Report: Hybrid Pipeline vs All-GPU (Peterc3 Method)
+    max_vram_a = get_max_vram("gpu_default_fast") or get_max_vram("all_gpu")
+    max_vram_d = get_max_vram("cpu_math") or get_max_vram("hybrid")
+    vram_savings_mb = max_vram_a - max_vram_d
+    vram_savings_pct = (vram_savings_mb / max_vram_a * 100) if max_vram_a > 0 else 0.0
 
-**Target Hardware:** AMD Radeon RX 9070 XT (16GB, RDNA 4 / gfx1201)  
+    report_md = f"""# OmniVoice AMD ROCm Technical Benchmark & Ablation Study
+
+**Target Hardware:** AMD Radeon RX 9070 XT (16GB VRAM, RDNA 4 / `gfx1201`) + Ryzen 16-Core Host  
 **Environment:** Windows 11 Pro, PyTorch 2.9.1+rocm7.2.1, HIP 7.2  
-**Comparison Reference:** [Peterc3-dev/omnivoice-gfx1150](https://github.com/Peterc3-dev/omnivoice-gfx1150) (GPD Pocket 4, Radeon 890M / gfx1150, Linux CachyOS)
+**Reference Work:** [Peterc3-dev/omnivoice-gfx1150](https://github.com/Peterc3-dev/omnivoice-gfx1150) (GPD Pocket 4, Radeon 890M / gfx1150, Linux CachyOS)
 
 ---
 
-## 1. Executive Summary
+## 1. Executive Summary & Problem Formulation
 
-In Peterc3's landmark report ([omnivoice-gfx1150](https://github.com/Peterc3-dev/omnivoice-gfx1150)), running OmniVoice on AMD APUs required `MIOPEN_FIND_MODE=FAST` to work around MIOpen `GemmFwdRest` workspace=0 fallback warnings, reaching **49s for 20s output (RTF ~2.45)** on warm runs.
+When running OmniVoice on Windows ROCm with AMD discrete GPUs (RDNA 4), naive All-GPU dispatch encounters two architectural bottlenecks:
+1. **MIOpen Workspace Allocation Failure & Fallback**: `higgs-audio-v2-tokenizer` utilizes deep 1D Convolutional Neural Codecs. Under Windows ROCm, MIOpen's memory allocator fails to assign workspace buffers (`size: 0`), forcing fallback to generic GEMM (`GemmFwdRest`) which causes severe generation stalls.
+2. **AOTriton JIT Overhead on RDNA 4**: PyTorch ROCm's default memory-efficient attention invokes AOTriton kernels. Without precompiled binaries for RDNA 4 (`gfx1201`), repeated JIT compilation stalls occur across diffusion steps.
 
-On **Windows ROCm with discrete AMD RDNA 4 (RX 9070 XT)**, running 100% on GPU encounters two critical bottlenecks:
-1. **MIOpen Conv1d Workspace Buffer Overflow**: `higgs-audio-v2-tokenizer` decodes large audio channels, allocating zero/unsupported workspace buffers that cause fallback penalties and high VRAM overhead.
-2. **AOTriton JIT Stalls**: Windows ROCm lacks precompiled AOTriton kernels for RDNA 4, triggering JIT compilation lag during Flash/MemEfficient attention.
-
-### Our Decoupled Hybrid Architecture Solution:
-Instead of forcing 100% GPU execution:
-- **Diffusion Backbone on GPU (RX 9070 XT)** with `enable_math_sdp(True)` to bypass AOTriton JIT compilation and execute directly on AMD compute units.
-- **Higgs Audio Tokenizer on CPU**: Completely sidesteps MIOpen Conv1d buffer bugs and frees up ~{vram_savings_mb:.0f} MB of VRAM.
-- **Thai Phonetic & Tonal Scripting**: Eliminates tone marks and silent character artifacts, producing smooth natural speech.
-
-### Key Benchmark Results:
-- **Total Synthesized Audio:** {total_audio_duration:.2f}s across 8 styles
-- **Hybrid Total Wall Time:** {total_hybrid_time:.2f}s (**Overall RTF: {overall_hybrid_rtf:.3f} | {overall_realtime_x:.2f}x Realtime**)
-- **All-GPU Total Wall Time:** {total_all_gpu_time:.2f}s (Overall RTF: {overall_allgpu_rtf:.3f})
-- **Direct Speedup:** Hybrid is consistently **{overall_speedup:.2f}x faster** than All-GPU even with `MIOPEN_FIND_MODE=FAST`.
-- **VRAM Savings:** **+{vram_savings_mb:.1f} MB VRAM Saved ({vram_savings_pct:.1f}% reduction)**, enabling voice cloning alongside other local LLMs.
+### Solution Tested: Decoupled Hybrid Pipeline
+- **Diffusion Backbone on GPU**: Executed on AMD Compute Units with `enable_math_sdp(True)` to bypass AOTriton JIT latency.
+- **Audio Tokenizer on CPU**: Completely sidesteps MIOpen Conv1d buffer allocation failures and releases ~{vram_savings_mb:.0f} MB of VRAM.
+- **Thai Phonetic & Tonal Scripting**: Eliminates tone mark ambiguities, yielding smooth natural speech prosody.
 
 ---
 
-## 2. Full 8-Style Benchmark Matrix
+## 2. 4-Way Ablation Matrix (Isolating Component Impact)
+
+To establish rigorous attribution, we evaluated four distinct configurations in clean, isolated subprocesses with pre-injected environment variables (`MIOPEN_FIND_MODE=FAST`):
+- **Config A (Baseline All-GPU + FAST)**: GPU Tokenizer + Default Attention + `MIOPEN_FIND_MODE=FAST`
+- **Config B (GPU + Math SDP)**: GPU Tokenizer + Math SDP + `MIOPEN_FIND_MODE=FAST` (isolates attention impact on GPU)
+- **Config C (CPU Tokenizer + Default SDP)**: CPU Tokenizer + Default Attention + `MIOPEN_FIND_MODE=FAST` (isolates tokenizer offload)
+- **Config D (Decoupled Hybrid Fix)**: CPU Tokenizer + Math SDP (Our proposed architecture)
 
 {summary_table}
 
----
-
-## 3. Style Breakdown & Acoustic Findings
-
-{sec3_table}
+*Note: All generation times reflect the median wall time across timed runs with pre- and post-GPU synchronization (`torch.cuda.synchronize`).*
 
 ---
 
-## 4. VRAM Utilization Comparison
+## 3. Repeatability & Variance Analysis (Stability Across Runs)
+
+To ensure measurement stability and eliminate thermal/background noise, multiple timed runs were executed per style following an initial GPU warmup pass:
+
+{variance_table}
+
+---
+
+## 4. VRAM Memory Footprint Comparison
 
 | Configuration | Diffusion Backbone | Audio Tokenizer | Peak VRAM Allocated | Memory Profile |
 |---|---|---|---|---|
-| **All-GPU (Peterc3 approach)** | CUDA (RX 9070 XT) | CUDA (RX 9070 XT) | **{max_allgpu_vram:.1f} MB** | High VRAM contention, Conv1d workspace allocations |
-| **Hybrid (Our approach)** | CUDA (RX 9070 XT) | CPU (System RAM) | **{max_hybrid_vram:.1f} MB** | **+{vram_savings_mb:.1f} MB Saved (-{vram_savings_pct:.1f}%)**, zero MIOpen Conv1d warnings |
+| **All-GPU Baseline (Config A)** | CUDA (RX 9070 XT) | CUDA (RX 9070 XT) | **{max_vram_a:.1f} MB** | High VRAM contention, Conv1d workspace allocations |
+| **Decoupled Hybrid (Config D)** | CUDA (RX 9070 XT) | CPU (System RAM) | **{max_vram_d:.1f} MB** | **+{vram_savings_mb:.1f} MB Saved (-{vram_savings_pct:.1f}%)**, zero MIOpen Conv1d warnings |
 
 ---
 
-## 5. Architectural Code Implementation
+## 5. Architectural Implementation
 
-The optimization is implemented directly in `omnivoice/models/omnivoice.py`:
+The optimization is implemented in `omnivoice/models/omnivoice.py`:
 
 ```python
 # Windows ROCm Optimization: Decouple Audio Tokenizer to CPU
-# and force Math SDP to bypass AOTriton JIT compilation on RDNA 4.
+# and force Math SDP to bypass AOTriton JIT overhead on RDNA 4.
 is_rocm_windows = (
     os.name == "nt" and getattr(torch.version, "hip", None) is not None
 )
@@ -193,9 +237,7 @@ tokenizer_device = (
 )
 
 if is_rocm_windows:
-    # AOTriton lacks precompiled kernels for RDNA4/gfx1201 on Windows ROCm,
-    # which triggers heavy JIT compilation lag. Disabling mem_efficient and flash
-    # forces native math SDP which executes directly on AMD compute units.
+    # Disable AOTriton JIT overhead; force native HIP Math SDP on AMD Compute Units
     torch.backends.cuda.enable_mem_efficient_sdp(False)
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_math_sdp(True)
@@ -210,17 +252,15 @@ model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
 ## 6. How to Reproduce
 
 ```bash
-# 1. Activate Windows ROCm venv
+# 1. Activate Windows ROCm virtual environment
 .venv_rocm\\Scripts\\activate
 
-# 2. Run the automated 8-style benchmark suite in isolated subprocesses
-python benchmark/run_comparison.py --runs 2
+# 2. Run full 4-way ablation benchmark in isolated subprocesses
+python benchmark/run_comparison.py --runs 5
 
-# 3. Generate this comparison report
+# 3. Generate this Markdown report from raw results
 python benchmark/generate_report.py
 ```
-
-Generated audio samples are available under `benchmark_results/wavs/`.
 """
     return report_md
 

@@ -8,14 +8,14 @@
 [![Benchmark](https://img.shields.io/badge/Benchmark-8--Style%20Peterc3%20Comparison-success)](BENCHMARK_REPORT.md)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-> **Zero-overhead Hybrid Pipeline patch for [k2-fsa/OmniVoice](https://github.com/k2-fsa/OmniVoice) running under native Windows with AMD ROCm.**  
-> Fixes the severe **11x slowdown** and MIOpen buffer crash on modern AMD GPUs (tested on **Radeon RX 9070 XT**, RDNA 4 / `gfx1201`).
+> **Decoupled Hybrid Pipeline patch for [k2-fsa/OmniVoice](https://github.com/k2-fsa/OmniVoice) running under native Windows with AMD ROCm.**  
+> Resolves the severe **11x slowdown** and MIOpen Conv1d workspace allocation stalls on modern AMD GPUs (tested on **Radeon RX 9070 XT**, RDNA 4 / `gfx1201`).
 
 ---
 
 ## ⚡ The Benchmark (Real Numbers)
 
-Tested on **AMD Radeon RX 9070 XT** (16GB VRAM, RDNA 4) + Ryzen 16-Core CPU on Windows 11:
+Tested on **AMD Radeon RX 9070 XT** (16GB VRAM, RDNA 4) + Ryzen 16-Core Host on Windows 11:
 
 | Setup / Mode | Status / Warnings | Generation Time / Sentence | Full 6-Sentence Audio (33s) | Real-Time Factor (RTF) |
 | :--- | :--- | :---: | :---: | :---: |
@@ -23,23 +23,24 @@ Tested on **AMD Radeon RX 9070 XT** (16GB VRAM, RDNA 4) + Ryzen 16-Core CPU on W
 | **CPU Only (16 Threads)** | ✅ oneDNN AVX | ~20s – 30s | ~1.5 – 2 Minutes | ~3.5x |
 | **🚀 Hybrid Fix (This Repo)** | **✅ Clean (Zero Warnings, Zero Fallbacks)** | **~2.1s** | **~14.3 Seconds** | **0.42x (2.4x faster than speech!)** |
 
-### 🔬 Head-to-Head Comparison: Decoupled Hybrid vs Peterc3 Method ([omnivoice-gfx1150](https://github.com/Peterc3-dev/omnivoice-gfx1150))
+### 🔬 4-Way Ablation Benchmark & Analysis
 
-In Peterc3's landmark report, running OmniVoice on AMD APUs required `MIOPEN_FIND_MODE=FAST` to work around MIOpen fallback warnings, reaching **49s for 20s output (RTF ~2.45)**.
+To rigorously separate the effects of Attention SDP vs Audio Tokenizer Offload, we tested **8 diverse voice styles** (Hook, Technical Explainer, Excited, Serious, Phonetic, Confident, Narrative, CTA) with multiple timed runs per style in clean, isolated subprocesses:
 
-We stress-tested **8 diverse voice styles** (Hook, Technical Explainer, Excited, Serious, Phonetic, Confident, Narrative, CTA) comparing Peterc3's All-GPU method (`MIOPEN_FIND_MODE=FAST`) against our Decoupled Hybrid pipeline on the same AMD hardware:
+| Configuration | Tokenizer Device | Attention SDP | MIOpen Mode | Median Time (8 Styles) | Peak VRAM | Primary Advantage |
+| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| **Config A (Baseline All-GPU + FAST)** | GPU (CUDA) | Default (AOTriton) | `FAST` (Pre-injected) | 1.57s – 3.98s | 2,425.4 MB | Fast Conv1D execution when FAST cache hits |
+| **Config B (All-GPU + Math SDP)** | GPU (CUDA) | Math SDP | `FAST` (Pre-injected) | 1.58s – 3.98s | 2,425.4 MB | Isolates Math SDP impact on GPU backbone |
+| **Config C (CPU Tokenizer + Default SDP)**| CPU (System RAM) | Default (AOTriton) | `FAST` (Pre-injected) | 1.67s – 4.24s | 1,660.0 MB | **+765.4 MB VRAM Saved (-31.6%)** |
+| **🚀 Config D (Decoupled Hybrid Fix)** | CPU (System RAM) | Math SDP | Standard | **1.67s – 4.22s** | **1,660.0 MB** | **+765.4 MB VRAM Saved (-31.6%) + Immune to MIOpen Conv1D Bugs** |
 
-| Metric | All-GPU Baseline (Peterc3 Method) | 🚀 Decoupled Hybrid (This Repo) | Improvement / Delta |
-| :--- | :---: | :---: | :---: |
-| **Total Audio Synthesized** | 49.37s | 49.37s | Identical testset |
-| **Total Generation Time** | 21.29s | **19.28s** | **1.10x Faster** (Up to 1.18x per style) |
-| **Best Real-Time Factor (RTF)** | 0.358 | **0.352 (2.84x Realtime)** | Lowest latency |
-| **Overall RTF (8 Styles)** | 0.431 | **0.391 (2.56x Realtime)** | Sustained high throughput |
-| **Peak VRAM Allocated** | 2,425.4 MB | **1,660.0 MB** | **+765.4 MB Saved (-31.6%)** |
-| **MIOpen Conv1d Fallbacks** | Susceptible if Find DB misses | **0 (Completely Bypassed)** | 100% Deterministic |
+#### Key Insights from the Ablation Study:
+1. **The VRAM Advantage (+765.4 MB / -31.6% footprint)**: Offloading the Higgs Audio Tokenizer to CPU drops peak VRAM allocation from **2.43 GB down to 1.66 GB**. For users running local TTS alongside an 8B/14B LLM on a 16GB GPU, this ~765 MB buffer is critical.
+2. **Negligible Latency Trade-Off**: Running the tokenizer on modern multi-core CPUs adds only ~100ms per generation (e.g. 1.68s vs 1.57s median), while delivering an impressive **0.35 – 0.46 Real-Time Factor (up to 2.84x Realtime)**.
+3. **Deterministic Stability**: Without `MIOPEN_FIND_MODE=FAST`, All-GPU falls into MIOpen `GemmFwdRest` fallback stalls. The Decoupled Hybrid architecture (Config D) is inherently immune to MIOpen Conv1d buffer allocation issues regardless of driver environment flags.
 
 > [!TIP]
-> 👉 **[Click here to view the Full 8-Style Benchmark & Architecture Report (BENCHMARK_REPORT.md)](BENCHMARK_REPORT.md)** with per-style RTF breakdown, acoustic notes, and VRAM memory profiling.
+> 👉 **[Click here to view the Full 4-Way Benchmark & Variance Report (BENCHMARK_REPORT.md)](BENCHMARK_REPORT.md)** with per-style RTF breakdown, Min-Max spread, Std Dev, and acoustic notes.
 
 ---
 
@@ -47,7 +48,7 @@ We stress-tested **8 diverse voice styles** (Hook, Technical Explainer, Excited,
 
 When users attempt to run OmniVoice on Windows with AMD ROCm (`device_map="cuda"`), generation stalls dramatically. We analyzed the execution trace down to kernel dispatches and identified **two critical bottlenecks**:
 
-### 1. The MIOpen Workspace Buffer Bug (`size: 0`)
+### 1. MIOpen Workspace Allocation Failure & Fallback to Generic GEMM (`size: 0`)
 OmniVoice uses **[HiggsAudioV2TokenizerModel](https://huggingface.co/eustlb/higgs-audio-v2-tokenizer)** (a deep 1D Convolutional Neural Audio Codec) to decode acoustic tokens into 24,000Hz waveform.  
 On Windows ROCm, MIOpen's memory allocator fails to assign workspace memory, returning:
 ```
@@ -77,7 +78,7 @@ Instead of fighting broken convolution drivers on GPU or accepting slow CPU gene
 │ 🧠 LLM Diffusion Backbone (1B+ Params, 32 Steps)            │
 │ ➔ Dispatched to GPU: AMD Radeon RX 9070 XT (FP16)           │
 │ ➔ Forces Native PyTorch Math SDP (Bypasses AOTriton JIT)     │
-│ ➔ Computes directly on AMD RDNA 4 Tensor Cores in ~1.9s     │
+│ ➔ Computes directly on AMD RDNA 4 Compute Units (AI Accelerators) │
 └─────────────────────────────┬───────────────────────────────┘
                               │
                               │ Lightweight Audio Tokens (few KB)
@@ -86,7 +87,7 @@ Instead of fighting broken convolution drivers on GPU or accepting slow CPU gene
 │ 🎵 HiggsAudioV2 Tokenizer (Neural Audio Codec Conv1D)       │
 │ ➔ Dispatched to CPU (16 Cores, AVX/oneDNN)                  │
 │ ➔ Decodes tokens into 24kHz waveform in just 0.05 seconds!  │
-│ ➔ 100% immune to MIOpen Workspace 0 bug                    │
+│ ➔ Completely bypasses MIOpen Conv1d workspace allocation bug │
 └─────────────────────────────┬───────────────────────────────┘
                               │
                               ▼
